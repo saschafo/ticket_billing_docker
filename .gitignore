@@ -1,0 +1,16 @@
+# Enthaelt Passwoerter und ggf. ein Repo-Token
+.env
+
+# Zur Laufzeit erzeugt
+apps.json
+backups/
+
+# Arbeitskopie der App (wird von build.sh geklont)
+apps-local/*
+!apps-local/.gitkeep
+
+# depscan reports (contain unpatched vulnerability details)
+.depscan/
+
+# Postfach-Sicherung: enthaelt Kennwoerter im Klartext
+mail-accounts*.json

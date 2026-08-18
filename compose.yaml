@@ -1,0 +1,259 @@
+name: ${COMPOSE_PROJECT_NAME:-ticket-billing}
+
+# ---------------------------------------------------------------------------
+# Gemeinsame Bausteine
+# ---------------------------------------------------------------------------
+x-image: &image
+  image: ${CUSTOM_IMAGE:-ticket-billing/frappe}:${CUSTOM_TAG:-16}
+  pull_policy: ${PULL_POLICY:-missing}
+
+x-backend-env: &backend-env
+  DB_HOST: db
+  DB_PORT: "3306"
+  MYSQL_ROOT_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD fehlt in .env}
+  MARIADB_ROOT_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD fehlt in .env}
+  FRAPPE_REDIS_CACHE: redis://redis-cache:6379
+  FRAPPE_REDIS_QUEUE: redis://redis-queue:6379
+
+x-backend: &backend
+  <<: *image
+  restart: ${RESTART_POLICY:-unless-stopped}
+  volumes:
+    - sites:/home/frappe/frappe-bench/sites
+    - logs:/home/frappe/frappe-bench/logs
+  environment:
+    <<: *backend-env
+  depends_on:
+    create-site:
+      condition: service_completed_successfully
+
+services:
+  # -------------------------------------------------------------------------
+  # Datenhaltung
+  # -------------------------------------------------------------------------
+  db:
+    image: mariadb:11.8
+    restart: ${RESTART_POLICY:-unless-stopped}
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --skip-character-set-client-handshake
+    environment:
+      MYSQL_ROOT_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD fehlt in .env}
+      MARIADB_ROOT_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD fehlt in .env}
+      MARIADB_AUTO_UPGRADE: "1"
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      start_period: 10s
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    volumes:
+      - db-data:/var/lib/mysql
+
+  redis-cache:
+    image: redis:8.6-alpine
+    restart: ${RESTART_POLICY:-unless-stopped}
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis-queue:
+    image: redis:8.6-alpine
+    restart: ${RESTART_POLICY:-unless-stopped}
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    volumes:
+      - redis-queue-data:/data
+
+  # -------------------------------------------------------------------------
+  # Einmal-Jobs: Bench konfigurieren und Site anlegen/migrieren
+  # -------------------------------------------------------------------------
+  configurator:
+    <<: *image
+    restart: "no"
+    volumes:
+      - sites:/home/frappe/frappe-bench/sites
+      - logs:/home/frappe/frappe-bench/logs
+    environment:
+      DB_HOST: db
+      DB_PORT: "3306"
+      REDIS_CACHE: redis-cache:6379
+      REDIS_QUEUE: redis-queue:6379
+      SOCKETIO_PORT: "9000"
+    entrypoint: ["bash", "-c"]
+    command:
+      - |
+        set -e
+        ls -1 apps > sites/apps.txt
+        bench set-config -g db_host "$$DB_HOST"
+        bench set-config -gp db_port "$$DB_PORT"
+        bench set-config -g redis_cache "redis://$$REDIS_CACHE"
+        bench set-config -g redis_queue "redis://$$REDIS_QUEUE"
+        bench set-config -g redis_socketio "redis://$$REDIS_QUEUE"
+        bench set-config -gp socketio_port "$$SOCKETIO_PORT"
+        bench set-config -g chromium_path /usr/bin/chromium-headless-shell
+        echo "Bench konfiguriert."
+    depends_on:
+      db:
+        condition: service_healthy
+      redis-cache:
+        condition: service_started
+      redis-queue:
+        condition: service_started
+
+  create-site:
+    <<: *image
+    restart: "no"
+    volumes:
+      - sites:/home/frappe/frappe-bench/sites
+      - logs:/home/frappe/frappe-bench/logs
+    environment:
+      SITE_NAME: ${SITE_NAME:-ticketbilling.localhost}
+      # Reihenfolge zaehlt: ERPNext vor ticket_billing.
+      SITE_APPS: ${SITE_APPS:-erpnext ticket_billing}
+      SITE_LANG: ${SITE_LANG:-de}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:?ADMIN_PASSWORD fehlt in .env}
+      DB_ROOT_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD fehlt in .env}
+      AUTO_MIGRATE: ${AUTO_MIGRATE:-1}
+    entrypoint: ["bash", "-c"]
+    command:
+      - |
+        set -e
+        wait-for-it -t 120 db:3306
+        wait-for-it -t 120 redis-cache:6379
+        wait-for-it -t 120 redis-queue:6379
+
+        start=$$(date +%s)
+        until [ -n "$$(jq -r '.db_host // empty' sites/common_site_config.json 2>/dev/null)" ] \
+           && [ -n "$$(jq -r '.redis_cache // empty' sites/common_site_config.json 2>/dev/null)" ] \
+           && [ -n "$$(jq -r '.redis_queue // empty' sites/common_site_config.json 2>/dev/null)" ]; do
+          echo "Warte auf sites/common_site_config.json ..."
+          sleep 5
+          if [ $$(( $$(date +%s) - start )) -gt 120 ]; then
+            echo "FEHLER: common_site_config.json fehlt oder ist unvollständig"
+            exit 1
+          fi
+        done
+
+        if [ -d "sites/$$SITE_NAME" ]; then
+          echo "Site $$SITE_NAME existiert bereits."
+          if [ "$$AUTO_MIGRATE" = "1" ]; then
+            echo "Führe 'bench migrate' aus ..."
+            bench --site "$$SITE_NAME" migrate
+          fi
+        else
+          echo "Lege Site $$SITE_NAME an ..."
+          bench new-site "$$SITE_NAME" \
+            --mariadb-user-host-login-scope='%' \
+            --db-root-username=root \
+            --db-root-password="$$DB_ROOT_PASSWORD" \
+            --admin-password="$$ADMIN_PASSWORD" \
+            --set-default
+          # Neue Sites haben den Scheduler standardmäßig aus.
+          bench --site "$$SITE_NAME" enable-scheduler
+
+          # Sprache der Site. Ohne das laeuft eine frisch angelegte Site auf
+          # Englisch -- die Uebersetzungen unter ticket_billing/translations
+          # greifen dann nie, und die Vue-Shell startet ebenfalls englisch.
+          # Zwei Stellen, weil Frappe sie unterschiedlich ausliest: die System
+          # Settings gelten fuer angemeldete Nutzer, der Default "lang" fuer
+          # Gaeste.
+          bench --site "$$SITE_NAME" execute frappe.db.set_single_value \
+            --kwargs "{'doctype': 'System Settings', 'fieldname': 'language', 'value': '$$SITE_LANG'}"
+          bench --site "$$SITE_NAME" execute frappe.db.set_default \
+            --kwargs "{'key': 'lang', 'val': '$$SITE_LANG'}"
+          bench --site "$$SITE_NAME" clear-cache
+        fi
+
+        # Apps abgleichen. Getrennt vom Anlegen der Site und idempotent:
+        # so kommt eine spaeter ergaenzte App auch auf eine bestehende Site,
+        # und ein abgebrochener Lauf laesst sich einfach wiederholen.
+        # Die Reihenfolge aus SITE_APPS wird eingehalten.
+        installed=$$(bench --site "$$SITE_NAME" list-apps 2>/dev/null | awk '{print $$1}')
+        for app in $$SITE_APPS; do
+          if echo "$$installed" | grep -qx "$$app"; then
+            echo "App $$app ist bereits installiert."
+          else
+            echo "Installiere App $$app ..."
+            bench --site "$$SITE_NAME" install-app "$$app"
+          fi
+        done
+
+        echo "Site $$SITE_NAME ist bereit."
+    depends_on:
+      configurator:
+        condition: service_completed_successfully
+
+  # -------------------------------------------------------------------------
+  # Anwendung
+  # -------------------------------------------------------------------------
+  backend:
+    <<: *backend
+    environment:
+      <<: *backend-env
+      GUNICORN_WORKERS: ${GUNICORN_WORKERS:-2}
+      GUNICORN_THREADS: ${GUNICORN_THREADS:-4}
+      GUNICORN_TIMEOUT: ${GUNICORN_TIMEOUT:-120}
+
+  websocket:
+    <<: *backend
+    command: ["node", "/home/frappe/frappe-bench/apps/frappe/socketio.js"]
+
+  scheduler:
+    <<: *backend
+    command: ["bench", "schedule"]
+
+  queue-short:
+    <<: *backend
+    command: ["bench", "worker", "--queue", "short,default"]
+
+  queue-long:
+    <<: *backend
+    command: ["bench", "worker", "--queue", "long,default,short"]
+
+  frontend:
+    <<: *image
+    networks:
+      default:
+        aliases:
+          # Der Site-Name zeigt innerhalb des Compose-Netzes auf diesen
+          # Container. Noetig fuer Realtime: Frappes Socket-Dienst prueft die
+          # Sitzung, indem er beim Backend zurueckfragt -- und die Adresse
+          # dafuer baut er aus dem Origin des Browsers. Ohne Alias laeuft
+          # diese Rueckfrage ins Leere, weil der Site-Name im Container nicht
+          # aufloest, und jede Socket-Verbindung endet mit
+          # "Unauthorized: fetch failed".
+          - ${SITE_NAME:-ticketbilling.localhost}
+    restart: ${RESTART_POLICY:-unless-stopped}
+    command: ["nginx-entrypoint.sh"]
+    environment:
+      BACKEND: backend:8000
+      SOCKETIO: websocket:9000
+      FRAPPE_SITE_NAME_HEADER: ${FRAPPE_SITE_NAME_HEADER:-$$host}
+      UPSTREAM_REAL_IP_ADDRESS: ${UPSTREAM_REAL_IP_ADDRESS:-127.0.0.1}
+      UPSTREAM_REAL_IP_HEADER: ${UPSTREAM_REAL_IP_HEADER:-X-Forwarded-For}
+      UPSTREAM_REAL_IP_RECURSIVE: ${UPSTREAM_REAL_IP_RECURSIVE:-off}
+      PROXY_READ_TIMEOUT: ${PROXY_READ_TIMEOUT:-120}
+      CLIENT_MAX_BODY_SIZE: ${CLIENT_MAX_BODY_SIZE:-50m}
+    volumes:
+      - sites:/home/frappe/frappe-bench/sites
+      - logs:/home/frappe/frappe-bench/logs
+    ports:
+      - "${HTTP_PUBLISH_PORT:-8080}:8080"
+    depends_on:
+      backend:
+        condition: service_started
+      websocket:
+        condition: service_started
+
+volumes:
+  sites:
+  logs:
+  db-data:
+  redis-queue-data:
